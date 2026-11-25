@@ -3,3 +3,5 @@ __pycache__/
 .DS_Store
 .cm/
 notes/
+rs/target/
+rs/bin/

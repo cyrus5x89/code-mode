@@ -15,8 +15,9 @@ Why it could help: every model call re-reads the whole conversation, so the bill
 | path | what |
 | --- | --- |
 | `skills/code-mode/SKILL.md` | the instructions the agent reads (runner, helpers, step loop, context + studio + machine rules) |
-| `skills/code-mode/scripts/cm.py` | the runner: Python 3.9+, stdlib only, one process per step, no daemon |
-| `install.sh` | links the skill the studio-styles way (store + Codex + agy) and puts `cm` on PATH |
+| `rs/` | the Rust front `cm` (one crate, one binary, no outside crates): arguments, state folder, lock, saved outputs, the 6000-char cut, `cm out` / `vars` / `reset`, and the shell jobs, codemap and note the script asks for |
+| `skills/code-mode/scripts/cm.py` | the step worker the front starts once per step (runs the script, keeps the variables), and the whole runner when there is no fresh binary: Python 3.9+, stdlib only |
+| `install.sh` | links the skill the studio-styles way (store + Codex + agy), builds `rs/` and puts `cm` on PATH |
 | `bench/bench.py` | the benchmark: fixture, tasks, checks, one run at a time, results table |
 | `bench/results.jsonl` | every measured run (time, calls, tokens, answer, check output) |
 
@@ -24,8 +25,42 @@ Why it could help: every model call re-reads the whole conversation, so the bill
 (exact anchor, refuses 0 or several matches), `write`, `j` / `studio` (JSON commands), `codemap` (writes
 `notes/code-map.md` once), `note` (one fact per line to `notes/facts.md`), `show`. Top-level plain values persist
 between steps (pickled per working folder in `$TMPDIR/code-mode`, dropped after 6 h idle); printed output is capped
-at 6000 chars and the full text stays readable with `cm out`. Python, not Rust: the agent's scripts are Python,
-and the runner is a thin `exec` around them, so a Rust binary would only add a build step.
+at 6000 chars and the full text stays readable with `cm out`.
+
+### Rust front (2026-11-25)
+
+`cm` on PATH is a small Rust binary (`rs/`, 480 KB, std only; release profile lto + codegen-units 1 + strip + panic
+abort; Rust 1.99). It reads the arguments, finds the state folder (same key and place as the Python runner, so both
+share state), takes the lock, drops state after 6 h, numbers the step, saves the full output, cuts what is printed and
+prints the footer; `cm out`, `cm vars` and `cm reset` never start Python. For a step it starts one Python worker
+(`cm.py`, imported so its bytecode is cached, heavy modules imported only when used) and serves the worker's helpers
+over two inherited pipes (pipes, not a Unix socket: Codex's sandbox refuses AF_UNIX): `sh` / `par` / `j` / `grep`
+run as `bash -c` in their own process group, killed as a group at the timeout, side by side for `par`, in the
+worker's current folder and environment; `codemap` (same output as the `ast` version, checked on 105 files) and `note`
+are Rust too. When the step ends, any job group still running is killed (a script that crashed or was stopped no
+longer leaves `sleep`s behind), and output a script's own `os.system` children print is now caught and saved too.
+
+The step script itself stays Python: that is what Codex and agy write, and the kept variables are pickles.
+
+Python fallback: when `rs/bin/cm` is older than `rs/src` / `Cargo.toml`, the front hands the whole call to
+`python3 cm.py` unchanged and starts one background rebuild (at most every 10 minutes, log in
+`rs/bin/background-build.log`), so no call waits for cargo. Without cargo, `install.sh` links `cm` to `cm.py`.
+
+Per call (median of 25, old runner, Rust front and the Python fallback interleaved; this Mac, load ~2.5; cwd =
+studio-styles `harness/`):
+
+| case | Python cm (before) | Rust front | change | Python fallback (new cm.py) |
+| --- | --- | --- | --- | --- |
+| cold step (after reset, `x = 1`) | 34.1 ms | 20.9 ms | -39 % | 26.2 ms |
+| trivial step (`y = 2`) | 34.1 ms | 21.3 ms | -38 % | 25.8 ms |
+| `par`: 2 reads + grep + git | 47.3 ms | 33.0 ms | -30 % | 40.4 ms |
+| `par`: 4 shell commands | 54.1 ms | 38.6 ms | -29 % | 46.0 ms |
+| `sh` (cat 3 files) + print cut at 6000 | 39.4 ms | 26.0 ms | -34 % | 32.6 ms |
+| `cm out 1:40` | 34.4 ms | 3.1 ms | -91 % | 25.2 ms |
+| `cm vars` | 33.6 ms | 2.9 ms | -91 % | 25.1 ms |
+
+Peak memory: `cm out` 28.8 MB -> 2.1 MB; a step 29 MB -> 21 MB (the Python worker). Next to a model call (seconds)
+this is small; it adds up on long jobs with many steps and `cm out` slices.
 
 ## Install (Mac)
 
@@ -36,7 +71,10 @@ bash ~/Documents/git/code-mode/install.sh
 
 This makes `~/.agents/skills/code-mode` a link to `skills/code-mode` here (the shared store, like support-mail and
 openmotion), links `~/.codex/skills/code-mode` and `~/.gemini/config/skills/code-mode` (where agy loads skills) to
-the store, and links `~/.local/bin/cm` to the runner. Claude is not linked: it has its own Code Mode. Edits in this
+the store, builds the Rust front (`python3 skills/code-mode/scripts/cm.py --build`: `cargo build --release` of `rs/`,
+copied to `rs/bin/cm` so `cargo clean` leaves it, about 5 s; needs Rust 1.99, `brew install rust`) and links `~/.local/bin/cm` to it, or to
+`cm.py` when there is no cargo. After a pull that touched `rs/`, the first `cm` call runs in Python and rebuilds in
+the background; to rebuild by hand run `cm.py --build` again or re-run `install.sh`. Claude is not linked: it has its own Code Mode. Edits in this
 repo are live. Then add the CC Switch row (import the local skill in the app, tick Codex + agy, not Claude; the
 app must be open for that, and closed for `ccswitch_skills.py update`), and check:
 `python3 ~/Documents/git/studio-styles/tools/ccswitch_skills.py check`.
@@ -75,6 +113,25 @@ agy "out" includes thinking tokens.
 
 Reproduce: `python3 bench/bench.py setup`, then `python3 bench/bench.py run <codex|agy> <t1|t2|t3> <base|cm>`
 or `all --cond base|cm` (base refuses to run while the skill is installed), then `python3 bench/bench.py table`.
+
+### Re-run with the Rust front (2026-11-25, `cm-rs`)
+
+Same fixture (studio-styles db71b31, rebuilt with `git archive`), same prompt as `cm`, Codex CLI 0.172.0 gpt-6.2-sol
+medium and agy 1.5.16 Hydrogen medium, one run each, all six ran first time:
+
+| agent | task | cm (Python runner) wall s / calls / input | cm-rs (Rust front) wall s / calls / input | correct |
+| --- | --- | --- | --- | --- |
+| agy | t1 | 30.9 / 6 / 188k | 49.9 / 7 / 229k | 6/6 |
+| agy | t2 | 35.9 / 5 / 149k | 31.8 / 5 / 147k | PASS |
+| agy | t3 | 26 / 5 / 146k | 32.4 / 5 / 147k | PASS |
+| codex | t1 | 40.5 / 6 / 225k | 25.8 / 4 / 147k | 6/6 |
+| codex | t2 | 40 / 7 / 273k | 32.5 / 6 / 227k | PASS |
+| codex | t3 | 30.7 / 6 / 233k | 57.4 / 6 / 233k | PASS |
+
+The runner saves ~13-15 ms a step and a run makes 2-5 steps, so under 0.1 s of a 25-57 s run: the wall-time swings
+here are the model (codex t3: same 6 calls, +27 s) and how many calls it chose (agy t1 one more, codex t1 two fewer).
+Same answers, nothing broke under Codex's sandbox or agy. The Rust front makes cm lighter, it does not change the
+verdict below.
 
 ## Verdict
 

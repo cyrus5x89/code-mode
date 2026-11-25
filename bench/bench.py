@@ -2,12 +2,13 @@
 """bench - does the code-mode skill make Codex and agy faster / smarter? One run at a time (16 GB Mac rule).
 
   bench.py setup                         fixture: a throwaway copy of studio-styles (harness + tools) in WORK
-  bench.py run <agent> <task> <cond>     agent = codex | agy, task = t1 | t2 | t3, cond = base | cm
+  bench.py run <agent> <task> <cond>     agent = codex | agy, task = t1 | t2 | t3, cond = base | cm | cm-rs
   bench.py all --cond base|cm [--agent codex|agy] [--task t1 ...]
   bench.py table                         markdown table from results.jsonl (median when a cell ran twice)
 
 Each run gets a fresh copy (git init, one commit) so runs never see each other. "cm" runs ask for the code-mode
-skill; "base" runs are the same prompt without it (run them before the skill is installed). Measured: wall time,
+skill; "base" runs are the same prompt without it (run them before the skill is installed); "cm-rs" is the same as
+"cm", run with the Rust front of cm (2026-11-25), kept as its own row. Measured: wall time,
 model calls, summed input tokens (what the calls re-read), max context, output tokens, and correctness (t1: facts
 right out of 6; t2/t3: the check prints PASS and the check file is untouched). Python 3.9+, stdlib only.
 """
@@ -221,7 +222,7 @@ def run(agent, task, cond):
     d = WORK / "runs" / f"{stamp}-{agent}-{task}-{cond}" / "repo"
     d.parent.mkdir(parents=True)
     prepare(task, d)
-    prompt = (CM_ASK if cond == "cm" else "") + TASKS[task]
+    prompt = (CM_ASK if cond != "base" else "") + TASKS[task]
     before = cm_dirs()
     m, answer = (run_codex if agent == "codex" else run_agy)(prompt, d)
     g = grade(task, d, answer)
@@ -259,8 +260,8 @@ def main():
     sp = ap.add_subparsers(dest="cmd", required=True)
     sp.add_parser("setup")
     r = sp.add_parser("run"); r.add_argument("agent", choices=["codex", "agy"]); r.add_argument("task", choices=list(TASKS))
-    r.add_argument("cond", choices=["base", "cm"])
-    a = sp.add_parser("all"); a.add_argument("--cond", choices=["base", "cm"], required=True)
+    r.add_argument("cond", choices=["base", "cm", "cm-rs"])
+    a = sp.add_parser("all"); a.add_argument("--cond", choices=["base", "cm", "cm-rs"], required=True)
     a.add_argument("--agent", choices=["codex", "agy"], action="append"); a.add_argument("--task", action="append")
     sp.add_parser("table")
     x = ap.parse_args()

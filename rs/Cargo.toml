@@ -1,0 +1,15 @@
+[package]
+name = "cm"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+description = "Rust front of the code-mode runner: arguments, state folder, lock, saved outputs, the cut, shell jobs, codemap, note. The step script itself runs in Python (skills/code-mode/scripts/cm.py --worker)."
+
+[dependencies]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
