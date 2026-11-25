@@ -18,7 +18,7 @@ lives in $CM_DIR or $TMPDIR/code-mode, and is dropped after CM_TTL hours (defaul
 Env: CM_CAP (printed chars per step, default 6000), CM_NOTES (fact file, default notes/facts.md), CM_TIMEOUT (sh
 default, 300 s). Python 3.9+, stdlib only. Exit 1 when the script raised.
 """
-import ast, contextlib, fnmatch, hashlib, io, json, os, pickle, re, shutil, subprocess, sys, tempfile, time, traceback
+import ast, builtins, contextlib, fcntl, fnmatch, hashlib, io, json, os, pickle, re, shutil, signal, subprocess, sys, tempfile, time, traceback
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -58,19 +58,27 @@ def _r(text, code, cmd):
     return r
 
 
+def _run(cmd, timeout, cwd, input, merge):
+    """bash -c in its own process group, so a timeout kills the whole pipeline, not only bash."""
+    p = subprocess.Popen(["bash", "-c", cmd], stdin=subprocess.PIPE if input is not None else subprocess.DEVNULL,
+                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT if merge else subprocess.PIPE,
+                         text=True, errors="replace", cwd=cwd, start_new_session=True)
+    try:
+        out, err = p.communicate(input, timeout=timeout or TIMEOUT)
+        return out or "", err or "", p.returncode
+    except subprocess.TimeoutExpired:
+        os.killpg(p.pid, signal.SIGKILL)
+        out, err = p.communicate()
+        return (out or "") + f"\n[timeout after {timeout or TIMEOUT} s, killed]", err or "", 124
+
+
 def sh(cmd, timeout=None, cwd=None, input=None):
     """Run a shell command (bash -c), stderr merged into stdout. Never raises: check .ok / .code."""
-    try:
-        p = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True, errors="replace", cwd=cwd,
-                           input=input, timeout=timeout or TIMEOUT)
-        return _r(p.stdout + p.stderr, p.returncode, cmd)
-    except subprocess.TimeoutExpired as e:
-        out = (e.stdout or b"")
-        out = out.decode(errors="replace") if isinstance(out, bytes) else out
-        return _r(out + f"\n[timeout after {timeout or TIMEOUT} s]", 124, cmd)
+    out, _, code = _run(cmd, timeout, cwd, input, merge=True)
+    return _r(out, code, cmd)
 
 
-def par(*jobs, workers=8):
+def par(*jobs, workers=4):
     """Run jobs at the same time and return their results in order. A job is a shell command (str) or a callable
     (lambda: read('a.py')). A job that raises returns the exception instead, so the others still count."""
     if len(jobs) == 1 and isinstance(jobs[0], (list, tuple)):
@@ -87,7 +95,8 @@ def par(*jobs, workers=8):
 
 def read(path, a=None, b=None, n=False):
     """Text of a file, or of lines a..b (1-based, inclusive). n=True prefixes line numbers."""
-    lines = Path(path).expanduser().read_text(encoding="utf-8", errors="replace").splitlines()
+    with open(Path(path).expanduser(), encoding="utf-8", errors="replace", newline="") as fh:
+        lines = fh.read().splitlines()
     a = max(1, a or 1)
     b = min(len(lines), b or len(lines))
     sel = lines[a - 1:b]
@@ -100,19 +109,20 @@ def read(path, a=None, b=None, n=False):
 def write(path, text):
     p = Path(path).expanduser()
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(text, encoding="utf-8")
+    with open(p, "w", encoding="utf-8", newline="") as fh:     # newline="": line endings stay as given
+        fh.write(text)
     return len(text)
 
 
 def edit(path, old, new, count=1):
     """Exact-string replace. count = how many matches must exist (0 = replace all, at least one).
     Raises when the file does not hold exactly that many, so a wrong anchor never writes."""
-    p = Path(path).expanduser()
-    s = p.read_text(encoding="utf-8")
+    with open(Path(path).expanduser(), encoding="utf-8", newline="") as fh:   # keep CRLF / LF as they are
+        s = fh.read()
     k = s.count(old)
     if k == 0 or (count and k != count):
         raise ValueError(f"edit {path}: {k} matches for the anchor, wanted {count or 'at least 1'}")
-    p.write_text(s.replace(old, new), encoding="utf-8")
+    write(path, s.replace(old, new))
     return k
 
 
@@ -138,7 +148,7 @@ def files(pattern="*", root=".", limit=2000):
 def grep(pattern, *paths, i=False, fixed=False, glob=None, ctx=0, limit=200):
     """grep -rn: a list of 'path:line:text' (text cut at 240 chars), at most 'limit' lines; skips .git,
     node_modules, binaries. glob='*.py' limits the files."""
-    cmd = ["grep", "-rnI", "-E" if not fixed else "-F"]
+    cmd = ["grep", "-rnIs", "-E" if not fixed else "-F"]
     if i:
         cmd.append("-i")
     if ctx:
@@ -149,8 +159,8 @@ def grep(pattern, *paths, i=False, fixed=False, glob=None, ctx=0, limit=200):
         cmd.append(f"--include={glob}")
     cmd += ["-e", pattern, "--", *(paths or ["."])]
     p = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
-    if p.returncode > 1:
-        raise RuntimeError(p.stderr.strip()[:500])
+    if p.returncode > 1 and not p.stdout:            # 2 with matches = one path was unreadable: keep the matches
+        raise RuntimeError(p.stderr.strip()[:500] or f"grep exit {p.returncode}")
     lines = [ln[:240] for ln in p.stdout.splitlines()]
     if len(lines) > limit:
         lines = lines[:limit] + [f"... {len(lines) - limit} more matches (raise limit= or narrow the pattern)"]
@@ -158,12 +168,12 @@ def grep(pattern, *paths, i=False, fixed=False, glob=None, ctx=0, limit=200):
 
 
 def j(cmd, timeout=None):
-    """Run a command that prints JSON and return it parsed (the text when it is not JSON)."""
-    r = sh(cmd, timeout)
+    """Run a command that prints JSON on stdout and return it parsed (stderr is ignored; the text when not JSON)."""
+    out, err, code = _run(cmd, timeout, None, None, merge=False)
     try:
-        return json.loads(r)
+        return json.loads(out)
     except ValueError:
-        return r
+        return _r(out + err, code, cmd)
 
 
 def studio(args, timeout=None):
@@ -246,8 +256,8 @@ def _cap(s, n):
     if len(s) <= n:
         return s
     head = s[: int(n * 0.6)]
-    tail = s[-int(n * 0.35):]
-    return f"{head}\n... [{len(s) - len(head) - len(tail)} chars cut; full text: cm out] ...\n{tail}"
+    tail = s[len(s) - int(n * 0.35):]
+    return f"{head}\n... [{len(s) - len(head) - len(tail)} chars cut; slice the full text: cm out [step] a:b] ...\n{tail}"
 
 
 HELPERS = dict(sh=sh, par=par, read=read, write=write, edit=edit, files=files, grep=grep, j=j, studio=studio,
@@ -256,34 +266,44 @@ HELPERS = dict(sh=sh, par=par, read=read, write=write, edit=edit, files=files, g
 
 # ---------- the runner ----------
 
+RESERVED = set(HELPERS) | set(dir(builtins))     # never kept: a kept list named "files" would break files() later
+
+
 def load(d):
+    """(vars, step, dropped). Each variable is pickled on its own, so one that cannot be loaded back (its class
+    lived on a sys.path the last step added) drops only itself."""
     f = d / "state.pkl"
     if not f.exists():
-        return {}, 0
+        return {}, 0, []
     if time.time() - f.stat().st_mtime > TTL:
-        reset(d)
-        d.joinpath("out").mkdir(parents=True, exist_ok=True)
-        return {}, 0
+        for x in list(d.glob("out/*.txt")) + [f]:
+            x.unlink()
+        return {}, 0, []
     try:
         st = pickle.loads(f.read_bytes())
-        return st.get("vars", {}), st.get("step", 0)
     except Exception:                     # noqa: BLE001 - a broken state file starts fresh
-        return {}, 0
+        return {}, 0, ["(state file unreadable)"]
+    out, dropped = {}, []
+    for k, b in st.get("vars", {}).items():
+        try:
+            out[k] = pickle.loads(b)
+        except Exception:                 # noqa: BLE001
+            dropped.append(k)
+    return out, st.get("step", 0), dropped
 
 
 def save(d, ns, step):
     keep = {}
     for k, v in ns.items():
-        if k.startswith("_") or (k in HELPERS and v is HELPERS[k]):
-            continue
-        if callable(v) or type(v).__name__ == "module":
+        if k.startswith("_") or k in RESERVED or callable(v) or type(v).__name__ == "module":
             continue
         try:
-            pickle.dumps(v)
+            keep[k] = pickle.dumps(v)
         except Exception:                 # noqa: BLE001 - not picklable: not kept
             continue
-        keep[k] = v
-    (d / "state.pkl").write_bytes(pickle.dumps({"vars": keep, "step": step}))
+    tmp = d / "state.pkl.tmp"
+    tmp.write_bytes(pickle.dumps({"vars": keep, "step": step}))
+    os.replace(tmp, d / "state.pkl")      # atomic: a reader never sees half a file
     return keep
 
 
@@ -292,10 +312,16 @@ def reset(d):
 
 
 def run(src, d):
-    vars_, step = load(d)
+    with open(d / "lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)   # two cm calls in one folder take turns instead of losing state
+        return _run_locked(src, d)
+
+
+def _run_locked(src, d):
+    vars_, step, dropped = load(d)
     step += 1
-    ns = dict(HELPERS)
-    ns.update(vars_)
+    ns = dict(vars_)
+    ns.update(HELPERS)
     ns["__name__"] = "__cm__"
     buf, err, t0 = io.StringIO(), False, time.time()
     with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
@@ -307,11 +333,17 @@ def run(src, d):
                 v = eval(compile(ast.Expression(last.value), "<step>", "eval"), ns)
                 if v is not None:
                     print(_fmt(v))
+        except SystemExit as e:           # sys.exit(0) / sys.exit() ends the step without an error
+            err = e.code not in (None, 0)
+            if err:
+                print(f"SystemExit: {e.code}")
         except BaseException as e:        # noqa: BLE001 - report, keep what was assigned before the error
             err = True
             tb = traceback.format_exception(type(e), e, e.__traceback__.tb_next)   # drop the runner's own frame
             print("".join(tb).rstrip()[-1500:])
     text = buf.getvalue()
+    if dropped:
+        text = f"[cm: could not load back {', '.join(dropped)} from the last step; recompute them]\n" + text
     (d / "out" / f"{step}.txt").write_text(text, encoding="utf-8")
     kept = save(d, ns, step)
     names = ", ".join(sorted(kept)[:12]) + (f" (+{len(kept) - 12})" if len(kept) > 12 else "")
@@ -328,14 +360,14 @@ def main(argv):
         print("cm: state cleared")
         return 0
     if argv[:1] == ["vars"]:
-        vars_, step = load(d)
+        vars_, step, _ = load(d)
         for k, v in sorted(vars_.items()):
             size = len(v) if hasattr(v, "__len__") else ""
             print(f"{k}: {type(v).__name__} {size}")
         print(f"[{len(vars_)} kept after step {step}]")
         return 0
     if argv[:1] == ["out"]:
-        _, step = load(d)
+        _, step, _ = load(d)
         rest = argv[1:]
         n = int(rest.pop(0)) if rest and rest[0].isdigit() else step
         f = d / "out" / f"{n}.txt"
@@ -343,10 +375,11 @@ def main(argv):
             print(f"cm: no output for step {n}")
             return 1
         lines = f.read_text(encoding="utf-8").splitlines()
-        if rest and ":" in rest[0]:
+        if rest and ":" in rest[0]:       # a range is printed whole: asking for it is the point
             a, b = (int(x) if x else None for x in rest[0].split(":", 1))
-            lines = lines[(a or 1) - 1:b]
-        print(_cap("\n".join(lines), CAP))
+            print("\n".join(lines[(a or 1) - 1:b]))
+        else:
+            print(_cap("\n".join(lines), CAP))
         return 0
     if argv[:1] == ["-f"] and len(argv) > 1:
         src = Path(argv[1]).read_text(encoding="utf-8")

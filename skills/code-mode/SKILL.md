@@ -23,22 +23,23 @@ PY
 page, so don't open the runner's source. One Python process per step;
 plain values (str, list, dict, numbers) assigned at top level are **kept for the next step** (per working folder,
 in `$TMPDIR/code-mode`; no setup or env needed).
-The printed text is capped at ~6000 chars (head + tail); the full text is saved: `cm out [step] [a:b]`.
+The printed text is capped at ~6000 chars (head + tail); the full text is saved: `cm out [step] a:b` prints a line
+range of it. Don't name a variable like a helper or builtin (`files`, `list`): those names are never kept.
 `cm vars` lists what is kept, `cm reset` clears it. Exit 1 + traceback when the script raised; what was assigned
-before the error is kept, so fix and go on from there.
+before the error is kept, so fix and go on from there. `sys.exit(0)` ends a step cleanly.
 
 Helpers (already imported, plus os re json sys time Path):
 
 | call | does |
 | --- | --- |
 | `sh(cmd, timeout=300)` | bash -c, stderr merged; returns a str with `.ok` `.code`; never raises |
-| `par(job, job, ...)` | runs jobs at once (str = shell command, callable = `lambda: ...`), results in order |
+| `par(job, job, ...)` | runs up to 4 jobs at once (str = shell command, callable = `lambda: ...`), results in order |
 | `read(path, a, b, n=True)` | file text or lines a..b (1-based), n = line numbers |
 | `grep(pat, *paths, glob="*.py", i=, fixed=, ctx=, limit=200)` | `path:line:text` list |
 | `files("*.py", root)` | paths by glob (skips .git, node_modules, __pycache__ ...) |
 | `edit(path, old, new, count=1)` | exact replace; raises unless the anchor matches `count` times (0 = all) |
 | `write(path, text)` | whole file |
-| `j(cmd)` / `studio("status")` | run a JSON-printing command, return it parsed |
+| `j(cmd)` / `studio("status")` | run a JSON-printing command, return stdout parsed |
 | `codemap(root)` | writes `notes/code-map.md` (file -> defs with line ranges), once per repo |
 | `note("fact")` | appends one line to `notes/facts.md` (CM_NOTES) |
 | `show(x, n)` | print a value capped at n chars |

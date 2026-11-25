@@ -74,7 +74,7 @@ agy "out" includes thinking tokens.
 | codex | t3 | cm | 1 | 30.7 | 6 | 233k | 42k | 837 | PASS |
 
 Reproduce: `python3 bench/bench.py setup`, then `python3 bench/bench.py run <codex|agy> <t1|t2|t3> <base|cm>`
-(base runs need the skill uninstalled), `python3 bench/bench.py table`.
+or `all --cond base|cm` (base refuses to run while the skill is installed), then `python3 bench/bench.py table`.
 
 ## Verdict
 
@@ -95,4 +95,5 @@ Reproduce: `python3 bench/bench.py setup`, then `python3 bench/bench.py run <cod
 So: keep it for agy on wide multi-file work and long jobs, ask for it by name; do not use it by default for Codex
 or for short tasks. The skill description says the same, so it does not trigger itself on small jobs.
 After the benchmark SKILL.md got two small fixes from the logs (do not open the runner's source; where the state
-lives) and the narrower trigger above; they were not re-measured.
+lives) and the narrower trigger above, and the runner got the review fixes (timeouts kill the whole process group,
+per-variable state with a lock, CRLF kept, `j()` parses stdout only); they were not re-measured.

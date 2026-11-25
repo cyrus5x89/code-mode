@@ -3,7 +3,7 @@
 
   bench.py setup                         fixture: a throwaway copy of studio-styles (harness + tools) in WORK
   bench.py run <agent> <task> <cond>     agent = codex | agy, task = t1 | t2 | t3, cond = base | cm
-  bench.py all [--cond base|cm] [--agent codex|agy] [--task t1 ...]
+  bench.py all --cond base|cm [--agent codex|agy] [--task t1 ...]
   bench.py table                         markdown table from results.jsonl (median when a cell ran twice)
 
 Each run gets a fresh copy (git init, one commit) so runs never see each other. "cm" runs ask for the code-mode
@@ -215,6 +215,8 @@ def cm_dirs():
 
 
 def run(agent, task, cond):
+    if cond == "base" and (Path.home() / ".agents/skills/code-mode").exists():
+        sys.exit("base runs need the skill uninstalled (rm the code-mode links), or the agent may pick it up itself")
     stamp = time.strftime("%Y%m%d-%H%M%S")
     d = WORK / "runs" / f"{stamp}-{agent}-{task}-{cond}" / "repo"
     d.parent.mkdir(parents=True)
@@ -258,7 +260,7 @@ def main():
     sp.add_parser("setup")
     r = sp.add_parser("run"); r.add_argument("agent", choices=["codex", "agy"]); r.add_argument("task", choices=list(TASKS))
     r.add_argument("cond", choices=["base", "cm"])
-    a = sp.add_parser("all"); a.add_argument("--cond", choices=["base", "cm"], action="append")
+    a = sp.add_parser("all"); a.add_argument("--cond", choices=["base", "cm"], required=True)
     a.add_argument("--agent", choices=["codex", "agy"], action="append"); a.add_argument("--task", action="append")
     sp.add_parser("table")
     x = ap.parse_args()
@@ -267,10 +269,9 @@ def main():
     elif x.cmd == "run":
         run(x.agent, x.task, x.cond)
     elif x.cmd == "all":
-        for c in x.cond or ["base", "cm"]:
-            for t in x.task or list(TASKS):
-                for ag in x.agent or ["codex", "agy"]:
-                    run(ag, t, c)
+        for t in x.task or list(TASKS):
+            for ag in x.agent or ["codex", "agy"]:
+                run(ag, t, x.cond)
     else:
         table()
 
